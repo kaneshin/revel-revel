@@ -17,6 +17,110 @@ import (
 
 var importErrorPattern = regexp.MustCompile("cannot find package \"([^\"]+)\"")
 
+func PreBuild() error {
+	// First, clear the generated files (to avoid them messing with ProcessSource).
+	cleanSource("tmp", "routes")
+
+	sourceInfo, compileError := ProcessSource(revel.CodePaths)
+	if compileError != nil {
+		return compileError
+	}
+
+	// Add the db.import to the import paths.
+	if dbImportPath, found := revel.Config.String("db.import"); found {
+		sourceInfo.InitImportPaths = append(sourceInfo.InitImportPaths, dbImportPath)
+	}
+
+	// Generate two source files.
+	templateArgs := map[string]interface{}{
+		"Controllers":    sourceInfo.ControllerSpecs(),
+		"ValidationKeys": sourceInfo.ValidationKeys,
+		"ImportPaths":    calcImportAliases(sourceInfo),
+		"TestSuites":     sourceInfo.TestSuites(),
+		"RunMode":        revel.RunMode,
+		"Port":           revel.HttpPort,
+		"ImportPath":     revel.ImportPath,
+	}
+	genSource("tmp", "main.go", MAIN, templateArgs)
+	genSource("routes", "routes.go", ROUTES, templateArgs)
+	return nil
+}
+
+// Custom Build the app:
+// 1. No Generate the the main.go file.
+// 2. Run the appropriate "go build" command.
+// Requires that revel.Init has been called previously.
+// Returns the path to the built binary, and an error if there was a problem building it.
+func CustomBuild(custom bool) (app *App, compileError *revel.Error) {
+	if !custom {
+		return Build()
+	}
+
+	// Read build config.
+	buildTags := revel.Config.StringDefault("build.tags", "")
+
+	// Build the user program (all code under app).
+	// It relies on the user having "go" installed.
+	goPath, err := exec.LookPath("go")
+	if err != nil {
+		revel.ERROR.Fatalf("Go executable not found in PATH.")
+	}
+
+	pkg, err := build.Default.Import(revel.ImportPath, "", build.FindOnly)
+	if err != nil {
+		revel.ERROR.Fatalln("Failure importing", revel.ImportPath)
+	}
+	binName := path.Join(pkg.BinDir, path.Base(revel.BasePath))
+	if runtime.GOOS == "windows" {
+		binName += ".exe"
+	}
+
+	gotten := make(map[string]struct{})
+	for {
+		appVersion := getAppVersion()
+		versionLinkerFlags := fmt.Sprintf("-X %s/app.APP_VERSION \"%s\"", revel.ImportPath, appVersion)
+
+		buildCmd := exec.Command(goPath, "build",
+			"-ldflags", versionLinkerFlags,
+			"-tags", buildTags,
+			"-o", binName, path.Join(revel.ImportPath, "app", "tmp"))
+		revel.TRACE.Println("Exec:", buildCmd.Args)
+		output, err := buildCmd.CombinedOutput()
+
+		// If the build succeeded, we're done.
+		if err == nil {
+			return NewApp(binName), nil
+		}
+		revel.ERROR.Println(string(output))
+
+		// See if it was an import error that we can go get.
+		matches := importErrorPattern.FindStringSubmatch(string(output))
+		if matches == nil {
+			return nil, newCompileError(output)
+		}
+
+		// Ensure we haven't already tried to go get it.
+		pkgName := matches[1]
+		if _, alreadyTried := gotten[pkgName]; alreadyTried {
+			return nil, newCompileError(output)
+		}
+		gotten[pkgName] = struct{}{}
+
+		// Execute "go get <pkg>"
+		getCmd := exec.Command(goPath, "get", pkgName)
+		revel.TRACE.Println("Exec:", getCmd.Args)
+		getOutput, err := getCmd.CombinedOutput()
+		if err != nil {
+			revel.ERROR.Println(string(getOutput))
+			return nil, newCompileError(output)
+		}
+
+		// Success getting the import, attempt to build again.
+	}
+	revel.ERROR.Fatalf("Not reachable")
+	return nil, nil
+}
+
 // Build the app:
 // 1. Generate the the main.go file.
 // 2. Run the appropriate "go build" command.
@@ -42,6 +146,9 @@ func Build(buildFlags ...string) (app *App, compileError *revel.Error) {
 		"ValidationKeys": sourceInfo.ValidationKeys,
 		"ImportPaths":    calcImportAliases(sourceInfo),
 		"TestSuites":     sourceInfo.TestSuites(),
+		"RunMode":        "",
+		"Port":           0,
+		"ImportPath":     "",
 	}
 	genSource("tmp", "main.go", MAIN, templateArgs)
 	genSource("routes", "routes.go", ROUTES, templateArgs)
@@ -316,9 +423,9 @@ import (
 )
 
 var (
-	runMode    *string = flag.String("runMode", "", "Run mode.")
-	port       *int    = flag.Int("port", 0, "By default, read from app.conf")
-	importPath *string = flag.String("importPath", "", "Go Import Path for the app.")
+	runMode    *string = flag.String("runMode", "{{.RunMode}}", "Run mode.")
+	port       *int    = flag.Int("port", {{.Port}}, "By default, read from app.conf")
+	importPath *string = flag.String("importPath", "{{.ImportPath}}", "Go Import Path for the app.")
 	srcPath    *string = flag.String("srcPath", "", "Path to the source root.")
 
 	// So compiler won't complain if the generated code doesn't reference reflect package...
